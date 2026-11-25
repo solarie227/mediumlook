@@ -80,7 +80,7 @@ final class EditorViewModel: ObservableObject {
                 self.loadInfo = info
                 if let message = info.message { self.alertMessage = message }
                 var next = self.settings
-                next.focus = CGPoint(x: 0.5, y: 0.5)
+                next.focus = info.autoFocus
                 next.depthSource = info.hasEmbeddedDepth ? .embedded : .estimated
                 next.mode = .result
                 self.settings = next
@@ -91,11 +91,34 @@ final class EditorViewModel: ObservableObject {
 
     // MARK: - 操作
 
+    /// 表示中の画像（切り出し後）の座標でクリックされた位置にピントを合わせる
     func setFocus(_ point: CGPoint) {
+        let crop = output.cropRect
+        let x = crop.minX + min(max(point.x, 0), 1) * crop.width
+        let y = crop.minY + min(max(point.y, 0), 1) * crop.height
         var next = settings
-        next.focus = CGPoint(x: min(max(point.x, 0), 1), y: min(max(point.y, 0), 1))
+        next.focus = CGPoint(x: x, y: y)
         next.mode = .result
         settings = next
+    }
+
+    /// 開いたときに決めたピント位置に戻す
+    func resetFocus() {
+        guard let info = loadInfo else { return }
+        var next = settings
+        next.focus = info.autoFocus
+        next.mode = .result
+        settings = next
+    }
+
+    /// ピント位置を表示中の画像（切り出し後）の座標にしたもの。範囲外なら nil
+    var focusInView: CGPoint? {
+        let crop = output.cropRect
+        guard crop.width > 0, crop.height > 0 else { return nil }
+        let x = (settings.focus.x - crop.minX) / crop.width
+        let y = (settings.focus.y - crop.minY) / crop.height
+        guard (0...1).contains(x), (0...1).contains(y) else { return nil }
+        return CGPoint(x: x, y: y)
     }
 
     func requestRender() {

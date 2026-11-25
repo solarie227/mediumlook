@@ -3,6 +3,7 @@ import Metal
 import CoreImage
 import CoreImage.CIFilterBuiltins
 import ImageIO
+import Vision
 
 enum ViewMode: String, CaseIterable, Sendable {
     case result, original, depth
@@ -20,7 +21,7 @@ struct RenderSettings: Equatable, Sendable {
     var fNumber: Double = 2.8
     var matchFOV: Bool = true
     var highlightBoost: Double = 2.0
-    /// ピント位置（画像の左上を0、右下を1とする座標）
+    /// ピント位置（切り出す前の元の写真で、左上を0、右下を1とする座標）
     var focus: CGPoint = CGPoint(x: 0.5, y: 0.5)
     var mode: ViewMode = .result
     var depthSource: DepthSource = .embedded
@@ -40,14 +41,36 @@ struct RenderOutput: @unchecked Sendable {
     var focusDistanceM: Double?
     var depthUsed: DepthSource?
     var cropFactor: Double = 1
+    /// 表示している範囲（元の写真で、左上を0、右下を1とする座標）
+    var cropRect = CGRect(x: 0, y: 0, width: 1, height: 1)
     var sourceFocal35: Double = 26
     var pixelSize: CGSize = .zero
     var milliseconds: Double = 0
     var message: String?
 }
 
+/// 開いたときのピント位置を何から決めたか
+enum FocusSource: String, Sendable {
+    /// EXIF の SubjectArea（撮影時にピントを合わせた範囲）
+    case subjectArea
+    /// 顔の検出
+    case face
+    case center
+
+    var label: String {
+        switch self {
+        case .subjectArea: return "撮影時のピント位置"
+        case .face: return "顔"
+        case .center: return "中央"
+        }
+    }
+}
+
 struct LoadInfo: Sendable {
     var hasEmbeddedDepth: Bool
+    var hasPortraitMatte = false
+    var autoFocus = CGPoint(x: 0.5, y: 0.5)
+    var focusSource: FocusSource = .center
     var sourceSize: CGSize
     var sourceFocal35: Double
     var message: String?
@@ -68,6 +91,10 @@ private final class Prepared {
     let color: CIImage
     let disparity: CIImage
     let cropFactor: Double
+    /// 元の写真のうち、この画像に使った範囲（左上を0、右下を1とする座標）
+    var cropRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+    /// ポートレートの人物マスク（同じ範囲・大きさ）
+    var matte: CIImage?
     var colorTexture: MTLTexture?
     var disparityTexture: MTLTexture?
     var outputTexture: MTLTexture?
@@ -103,6 +130,7 @@ final class RenderEngine: @unchecked Sendable {
     private var sourceColor: CIImage?
     private var embeddedDisparity: CIImage?
     private var estimatedDisparity: CIImage?
+    private var portraitMatte: CIImage?
     private var sourceFocal35: Double = RenderEngine.defaultFocal35
 
     private var previewKey: String?
@@ -143,12 +171,18 @@ final class RenderEngine: @unchecked Sendable {
                 disparity = filter.outputImage
             }
             embeddedDisparity = disparity?.movedToOrigin()
+            portraitMatte = CIImage(data: data, options: [.auxiliaryPortraitEffectsMatte: true,
+                                                          .applyOrientationProperty: true])?.movedToOrigin()
             estimatedDisparity = nil
             sourceFocal35 = Self.focal35(from: data) ?? Self.defaultFocal35
             previewKey = nil
             preview = nil
+            let (autoFocus, focusSource) = initialFocus(data: data)
 
             completion(LoadInfo(hasEmbeddedDepth: embeddedDisparity != nil,
+                                hasPortraitMatte: portraitMatte != nil,
+                                autoFocus: autoFocus,
+                                focusSource: focusSource,
                                 sourceSize: color.extent.size,
                                 sourceFocal35: sourceFocal35,
                                 message: nil))
@@ -185,7 +219,7 @@ final class RenderEngine: @unchecked Sendable {
                 completion("画像の準備に失敗しました")
                 return
             }
-            guard let focus = focusDisparity(at: settings.focus, in: prepared.disparity) else {
+            guard let focus = focusDisparity(at: settings.focus, in: prepared) else {
                 completion("ピント位置の深度を読み取れませんでした")
                 return
             }
@@ -234,6 +268,7 @@ final class RenderEngine: @unchecked Sendable {
             return out
         }
         out.cropFactor = prepared.cropFactor
+        out.cropRect = prepared.cropRect
         out.pixelSize = prepared.color.extent.size
 
         switch settings.mode {
@@ -252,7 +287,7 @@ final class RenderEngine: @unchecked Sendable {
                 out.image = makeCGImage(prepared.color)
                 break
             }
-            guard let focus = focusDisparity(at: settings.focus, in: prepared.disparity) else {
+            guard let focus = focusDisparity(at: settings.focus, in: prepared) else {
                 out.image = makeCGImage(prepared.color)
                 out.message = "その位置の深度を読み取れませんでした。別の場所をクリックしてください。"
                 break
@@ -371,6 +406,16 @@ final class RenderEngine: @unchecked Sendable {
         }
 
         let prepared = Prepared(color: preparedColor, disparity: preparedDisparity, cropFactor: cropFactor)
+        // 中央の切り出しなので、左下原点の crop をそのまま左上原点の比率に直せる
+        prepared.cropRect = CGRect(x: crop.minX / width, y: (height - crop.maxY) / height,
+                                   width: crop.width / width, height: crop.height / height)
+        if let matte = portraitMatte {
+            let upscaledMatte = matte
+                .samplingLinear()
+                .transformed(by: CGAffineTransform(scaleX: width / matte.extent.width,
+                                                   y: height / matte.extent.height))
+            prepared.matte = resample(upscaledMatte, crop: crop, scale: scale, width: outW, height: outH, highQuality: false)
+        }
         prepared.colorTexture = makeTexture(from: preparedColor, colorSpace: linearSpace)
         prepared.disparityTexture = makeTexture(from: preparedDisparity, colorSpace: nil)
         prepared.outputTexture = makeTexture(width: Int(outW), height: Int(outH))
@@ -505,26 +550,126 @@ final class RenderEngine: @unchecked Sendable {
 
     // MARK: - 深度の読み取り
 
-    /// クリック位置の周り（長辺の約1.5%）の平均視差
-    private func focusDisparity(at point: CGPoint, in disparity: CIImage) -> Float? {
+    /// ピント位置（元の写真の座標）の周り（長辺の約1.5%）の平均視差。
+    /// 人物マスクの内側を指しているときは、マスクの内側だけで平均する（髪の隙間から見える背景を拾わないため）
+    private func focusDisparity(at sourcePoint: CGPoint, in prepared: Prepared) -> Float? {
+        let disparity = prepared.disparity
+        let crop = prepared.cropRect
+        // 切り出した範囲の外なら、範囲の端に寄せる
+        let px = min(max((sourcePoint.x - crop.minX) / crop.width, 0), 1)
+        let py = min(max((sourcePoint.y - crop.minY) / crop.height, 0), 1)
         let w = disparity.extent.width
         let h = disparity.extent.height
         let r = max(4, 0.015 * max(w, h))
         // Core Image は左下が原点なので y を反転
-        let cx = point.x * w
-        let cy = (1 - point.y) * h
+        let cx = px * w
+        let cy = (1 - py) * h
         let rect = CGRect(x: cx - r, y: cy - r, width: 2 * r, height: 2 * r).intersection(disparity.extent)
         guard !rect.isEmpty else { return nil }
 
+        if let matte = prepared.matte, let coverage = average(of: matte, in: rect), coverage > 0.5 {
+            let weighted = CIFilter.multiplyCompositing()
+            weighted.inputImage = disparity
+            weighted.backgroundImage = matte
+            if let image = weighted.outputImage,
+               let sum = average(of: image, in: rect), sum.isFinite, sum > 0 {
+                return sum / coverage
+            }
+        }
+        guard let value = average(of: disparity, in: rect), value.isFinite, value > 0 else { return nil }
+        return value
+    }
+
+    /// 範囲内の平均（赤の成分）
+    private func average(of image: CIImage, in rect: CGRect) -> Float? {
         let filter = CIFilter.areaAverage()
-        filter.inputImage = disparity
+        filter.inputImage = image
         filter.extent = rect
         guard let output = filter.outputImage else { return nil }
         var pixel = [Float](repeating: 0, count: 4)
         ciContext.render(output, toBitmap: &pixel, rowBytes: 16,
                          bounds: output.extent, format: .RGBAf, colorSpace: nil)
-        let value = pixel[0]
-        return value.isFinite && value > 0 ? value : nil
+        return pixel[0]
+    }
+
+    // MARK: - 開いたときのピント位置
+
+    /// 1. 撮影時にピントを合わせた範囲（EXIF SubjectArea）が中央の初期値でなければ、それを使う
+    /// 2. なければ顔（いちばん大きい顔の目のあたり）
+    /// 3. どちらもなければ SubjectArea の中心か、画像の中央
+    private func initialFocus(data: Data) -> (CGPoint, FocusSource) {
+        let area = Self.subjectArea(from: data)
+        if let area, area.specific {
+            return (area.point, .subjectArea)
+        }
+        if let face = detectFace() {
+            return (face, .face)
+        }
+        return (area?.point ?? CGPoint(x: 0.5, y: 0.5), .center)
+    }
+
+    /// EXIF の SubjectArea を、向きを直した写真の座標（左上を0、右下を1）にして返す。
+    /// specific は、撮影時にタップや顔で決めた範囲らしいか（中央の広い範囲は初期値とみなす）
+    private static func subjectArea(from data: Data) -> (point: CGPoint, specific: Bool)? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any],
+              let values = exif[kCGImagePropertyExifSubjectArea] as? [NSNumber],
+              values.count >= 2
+        else { return nil }
+        let area = values.map { $0.doubleValue }
+        // SubjectArea は記録されたままの（回転前の）画素の座標
+        let width = (exif[kCGImagePropertyExifPixelXDimension] as? NSNumber)?.doubleValue
+            ?? (props[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue ?? 0
+        let height = (exif[kCGImagePropertyExifPixelYDimension] as? NSNumber)?.doubleValue
+            ?? (props[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue ?? 0
+        guard width > 0, height > 0 else { return nil }
+        let x = area[0] / width
+        let y = area[1] / height
+        guard (0...1).contains(x), (0...1).contains(y) else { return nil }
+
+        let offCenter = hypot(x - 0.5, y - 0.5) > 0.05
+        var small = false
+        if area.count >= 4 {
+            small = (area[2] / width) * (area[3] / height) < 0.1
+        } else if area.count == 3 {
+            small = area[2] / max(width, height) < 0.3
+        }
+        let orientation = (props[kCGImagePropertyOrientation] as? NSNumber)?.uint32Value ?? 1
+        return (oriented(CGPoint(x: x, y: y), orientation: orientation), offCenter || small)
+    }
+
+    /// 回転前の座標（左上原点・比率）を、EXIF の向きを適用したあとの座標に直す
+    private static func oriented(_ p: CGPoint, orientation: UInt32) -> CGPoint {
+        switch orientation {
+        case 2: return CGPoint(x: 1 - p.x, y: p.y)      // 左右反転
+        case 3: return CGPoint(x: 1 - p.x, y: 1 - p.y)  // 180度
+        case 4: return CGPoint(x: p.x, y: 1 - p.y)      // 上下反転
+        case 5: return CGPoint(x: p.y, y: p.x)          // 転置
+        case 6: return CGPoint(x: 1 - p.y, y: p.x)      // 時計回りに90度（iPhoneの縦位置）
+        case 7: return CGPoint(x: 1 - p.y, y: 1 - p.x)
+        case 8: return CGPoint(x: p.y, y: 1 - p.x)      // 反時計回りに90度
+        default: return p
+        }
+    }
+
+    /// いちばん大きい顔の目のあたり（向きを直した写真の座標、左上を0）
+    private func detectFace() -> CGPoint? {
+        guard let sourceColor else { return nil }
+        let scale = min(1, 1024 / max(sourceColor.extent.width, sourceColor.extent.height))
+        let small = sourceColor.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let cgImage = ciContext.createCGImage(small, from: small.extent, format: .RGBA8,
+                                                    colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+        else { return nil }
+        let request = VNDetectFaceRectanglesRequest()
+        try? VNImageRequestHandler(cgImage: cgImage, options: [:]).perform([request])
+        let faces = (request.results ?? []).filter { $0.boundingBox.width * $0.boundingBox.height > 0.001 }
+        guard let face = faces.max(by: {
+            $0.boundingBox.width * $0.boundingBox.height < $1.boundingBox.width * $1.boundingBox.height
+        }) else { return nil }
+        // Vision は左下が原点。目は顔の枠の上から約4割の高さ
+        let box = face.boundingBox
+        return CGPoint(x: box.midX, y: 1 - (box.maxY - 0.4 * box.height))
     }
 
     private func minMax(of disparity: CIImage) -> (min: Float, max: Float)? {

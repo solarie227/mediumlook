@@ -80,12 +80,12 @@ struct CanvasView: View {
                                         vm.setFocus(CGPoint(x: location.x / geo.size.width,
                                                             y: location.y / geo.size.height))
                                     }
-                                if vm.settings.mode == .result {
+                                if vm.settings.mode == .result, let focus = vm.focusInView {
                                     Circle()
                                         .stroke(.yellow, lineWidth: 1.5)
                                         .frame(width: 24, height: 24)
-                                        .position(x: vm.settings.focus.x * geo.size.width,
-                                                  y: vm.settings.focus.y * geo.size.height)
+                                        .position(x: focus.x * geo.size.width,
+                                                  y: focus.y * geo.size.height)
                                         .allowsHitTesting(false)
                                 }
                             }
@@ -227,12 +227,19 @@ struct InspectorView: View {
                     LabeledContent("ピント距離", value: String(format: "約%.1fm", distance))
                 }
                 if let info = vm.loadInfo {
+                    LabeledContent("ピントの初期位置", value: info.focusSource.label)
+                    if info.hasPortraitMatte {
+                        LabeledContent("人物マスク", value: "あり")
+                    }
                     LabeledContent("元の画角", value: "換算\(Int(info.sourceFocal35))mm")
                     LabeledContent("元の解像度", value: "\(Int(info.sourceSize.width))×\(Int(info.sourceSize.height))")
                 }
                 if vm.hasPhoto {
                     LabeledContent("切り出し", value: String(format: "×%.2f", vm.output.cropFactor))
                     LabeledContent("処理時間", value: "\(Int(vm.output.milliseconds))ms")
+                }
+                if vm.hasPhoto {
+                    Button("ピントを初期位置に戻す") { vm.resetFocus() }
                 }
                 Text("画像をクリックするとピント位置が変わります。")
                     .font(.caption)
