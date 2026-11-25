@@ -55,9 +55,7 @@ final class DepthEstimator: @unchecked Sendable {
         try? fm.removeItem(at: compiled)
         try? fm.removeItem(at: package)
 
-        lock.lock()
-        model = nil
-        lock.unlock()
+        lock.withLock { model = nil }
     }
 
     /// 相対的な視差（手前ほど大きい値）を、入力と同じ向きの低解像度画像で返す
