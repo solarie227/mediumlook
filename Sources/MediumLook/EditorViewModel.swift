@@ -22,6 +22,9 @@ final class EditorViewModel: ObservableObject {
     @Published private(set) var modelStatus: String?
     @Published private(set) var fileName: String?
     @Published var alertMessage: String?
+    /// 画面側の一時的な状態（写真ライブラリで選んだ項目、ドラッグ中かどうか）
+    @Published var pickerItem: PhotosPickerItem?
+    @Published var isDropTargeted = false
 
     let engine: RenderEngine?
 

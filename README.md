@@ -69,6 +69,7 @@ b = f² / (N(s − f)) × |d − s| / d
 
 ## うまく動かないとき
 
+- **`SwiftUIMacros` が見つからないというエラー**：Xcode本体ではなく Command Line Tools でビルドされています。`build_app.sh` はXcodeがあれば自動でそちらを使います。手で切り替えるなら `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`
 - **ビルドエラーが出る**：エラー文をそのまま貼ってください
 - **推定モデルの導入に失敗する**：ネットワークを確認してください。モデルは `~/Library/Application Support/MediumLook/` に置かれます
 - **推定した深度の明暗が逆**（深度表示で奥が明るい）：モデルの出力の向きが想定と違います。教えてください

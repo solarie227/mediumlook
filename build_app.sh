@@ -3,6 +3,16 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Command Line Tools が選ばれていても、Xcode があればそちらでビルドする
+# （新しいSDKの SwiftUI マクロ（@State など）の実装は Xcode にしか入っていないため）
+if [ -z "${DEVELOPER_DIR:-}" ] && [[ "$(xcode-select -p 2>/dev/null)" == *CommandLineTools* ]]; then
+    XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort | tail -n 1 || true)
+    if [ -n "$XCODE" ]; then
+        export DEVELOPER_DIR="$XCODE/Contents/Developer"
+        echo "Xcode を使ってビルドします: $XCODE"
+    fi
+fi
+
 swift build -c release
 BIN_DIR=$(swift build -c release --show-bin-path)
 

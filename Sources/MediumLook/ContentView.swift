@@ -3,13 +3,12 @@ import PhotosUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
+    // Command Line Tools だけでもビルドできるよう、@State（新しいSDKではマクロ）は使わず ViewModel に持たせる
     @ObservedObject var vm: EditorViewModel
-    @State private var pickerItem: PhotosPickerItem?
-    @State private var isDropTargeted = false
 
     var body: some View {
         HSplitView {
-            CanvasView(vm: vm, isDropTargeted: isDropTargeted)
+            CanvasView(vm: vm, isDropTargeted: vm.isDropTargeted)
                 .frame(minWidth: 520, maxWidth: .infinity, maxHeight: .infinity)
             InspectorView(vm: vm)
                 .frame(minWidth: 280, idealWidth: 300, maxWidth: 360)
@@ -23,7 +22,7 @@ struct ContentView: View {
                 }
                 .help("ファイルを開く（⌘O）")
 
-                PhotosPicker(selection: $pickerItem, matching: .images, preferredItemEncoding: .current) {
+                PhotosPicker(selection: $vm.pickerItem, matching: .images, preferredItemEncoding: .current) {
                     Label("写真ライブラリ", systemImage: "photo.on.rectangle")
                 }
                 .help("写真ライブラリから選ぶ")
@@ -38,10 +37,10 @@ struct ContentView: View {
             }
         }
         .navigationTitle(vm.fileName ?? "中判ルック")
-        .onChange(of: pickerItem) { _, item in
+        .onChange(of: vm.pickerItem) { _, item in
             Task { await vm.load(item) }
         }
-        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+        .onDrop(of: [.fileURL], isTargeted: $vm.isDropTargeted) { providers in
             guard let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 guard let url else { return }
