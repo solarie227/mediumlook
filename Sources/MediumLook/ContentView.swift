@@ -180,6 +180,24 @@ struct InspectorView: View {
                     }
                 }
 
+                Toggle(isOn: $vm.settings.refineEdges) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("輪郭を写真に合わせる")
+                        Text("深度の境目を写真の明暗の境目にそろえ、被写体の縁のにじみを減らします。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if vm.settings.refineEdges {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("合わせ方 \(edgeStrengthLabel)")
+                        Slider(value: $vm.settings.edgeStrength, in: 0...1, step: 0.25)
+                        Text("細かくするほど枝や髪に沿いますが、模様の多い場所で深度がまだらになることがあります。⌘3で深度を確認できます。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 if !vm.modelInstalled {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("深度データがない写真には、推定モデル（約50MB）が必要です。")
@@ -222,6 +240,16 @@ struct InspectorView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private var edgeStrengthLabel: String {
+        switch vm.settings.edgeStrength {
+        case ..<0.2: return "なめらか"
+        case ..<0.4: return "やや なめらか"
+        case ..<0.6: return "標準"
+        case ..<0.8: return "やや細かく"
+        default: return "細かく"
+        }
     }
 
     private var fStopIndex: Binding<Double> {

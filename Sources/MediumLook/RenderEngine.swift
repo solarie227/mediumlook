@@ -26,6 +26,13 @@ struct RenderSettings: Equatable, Sendable {
     var depthSource: DepthSource = .embedded
     /// 推定深度のときに使う、ピント位置までの距離（m）
     var subjectDistance: Double = 2.0
+    /// 深度を引き伸ばすとき、写真の明暗の境目に合わせる
+    var refineEdges: Bool = true
+    /// 境目への合わせ方（0：なめらか 〜 1：細かく追従）
+    var edgeStrength: Double = 0.5
+
+    /// CIEdgePreserveUpsampleFilter の lumaSigma（小さいほど明暗の差に敏感）
+    var edgeLumaSigma: Float { Float(0.3 * pow(0.1, edgeStrength)) }
 }
 
 struct RenderOutput: @unchecked Sendable {
@@ -173,7 +180,8 @@ final class RenderEngine: @unchecked Sendable {
                 completion(depth.message ?? "深度データがありません")
                 return
             }
-            guard let prepared = prepare(longEdge: nil, preset: preset, matchFOV: settings.matchFOV, disparity: depthImage) else {
+            guard let prepared = prepare(longEdge: nil, preset: preset, matchFOV: settings.matchFOV, disparity: depthImage,
+                                         edgeLumaSigma: settings.refineEdges ? settings.edgeLumaSigma : nil) else {
                 completion("画像の準備に失敗しました")
                 return
             }
@@ -212,12 +220,13 @@ final class RenderEngine: @unchecked Sendable {
         out.depthUsed = depth.used
         out.message = depth.message
 
-        let key = "\(settings.presetID)-\(settings.matchFOV)-\(depth.used?.rawValue ?? "none")"
+        let key = "\(settings.presetID)-\(settings.matchFOV)-\(depth.used?.rawValue ?? "none")-\(settings.refineEdges)-\(settings.edgeStrength)"
         if key != previewKey {
             // 深度がなくても元画像は表示できるよう、ダミーの深度で切り出す
             let disparityForPrep = depth.image ?? CIImage(color: .white).cropped(to: sourceColor.extent)
-            preview = prepare(longEdge: Self.previewLongEdge, preset: preset,
-                              matchFOV: settings.matchFOV, disparity: disparityForPrep)
+            preview = prepare(longEdge: Self.previewLongEdge, preset: preset, matchFOV: settings.matchFOV,
+                              disparity: disparityForPrep,
+                              edgeLumaSigma: depth.image != nil && settings.refineEdges ? settings.edgeLumaSigma : nil)
             previewKey = key
         }
         guard let prepared = preview else {
@@ -320,8 +329,10 @@ final class RenderEngine: @unchecked Sendable {
 
     // MARK: - 切り出しと縮小
 
-    /// フォーマットの縦横比に切り出し、必要なら画角も合わせる。longEdge が nil ならフル解像度
-    private func prepare(longEdge: CGFloat?, preset: FormatPreset, matchFOV: Bool, disparity: CIImage) -> Prepared? {
+    /// フォーマットの縦横比に切り出し、必要なら画角も合わせる。longEdge が nil ならフル解像度。
+    /// edgeLumaSigma を渡すと、深度を写真の明暗の境目に合わせて引き伸ばす
+    private func prepare(longEdge: CGFloat?, preset: FormatPreset, matchFOV: Bool, disparity: CIImage,
+                         edgeLumaSigma: Float? = nil) -> Prepared? {
         guard let color = sourceColor else { return nil }
         let width = color.extent.width
         let height = color.extent.height
@@ -345,12 +356,19 @@ final class RenderEngine: @unchecked Sendable {
         let outH = floor(cropH * scale)
 
         let preparedColor = resample(color, crop: crop, scale: scale, width: outW, height: outH, highQuality: true)
-        // 深度は低解像度なので、まずカラー画像と同じ大きさに引き伸ばす
-        let upscaled = disparity
-            .samplingLinear()
-            .transformed(by: CGAffineTransform(scaleX: width / disparity.extent.width,
-                                               y: height / disparity.extent.height))
-        let preparedDisparity = resample(upscaled, crop: crop, scale: scale, width: outW, height: outH, highQuality: false)
+        let preparedDisparity: CIImage
+        if let edgeLumaSigma,
+           let refined = edgeAwareDisparity(disparity, crop: crop, sourceSize: CGSize(width: width, height: height),
+                                            guide: preparedColor, lumaSigma: edgeLumaSigma) {
+            preparedDisparity = refined
+        } else {
+            // 深度は低解像度なので、まずカラー画像と同じ大きさに引き伸ばす
+            let upscaled = disparity
+                .samplingLinear()
+                .transformed(by: CGAffineTransform(scaleX: width / disparity.extent.width,
+                                                   y: height / disparity.extent.height))
+            preparedDisparity = resample(upscaled, crop: crop, scale: scale, width: outW, height: outH, highQuality: false)
+        }
 
         let prepared = Prepared(color: preparedColor, disparity: preparedDisparity, cropFactor: cropFactor)
         prepared.colorTexture = makeTexture(from: preparedColor, colorSpace: linearSpace)
@@ -358,6 +376,26 @@ final class RenderEngine: @unchecked Sendable {
         prepared.outputTexture = makeTexture(width: Int(outW), height: Int(outH))
         prepared.disparityRange = minMax(of: preparedDisparity) ?? (0, 1)
         return prepared
+    }
+
+    /// 低解像度の深度を、写真（guide）の明暗の境目に沿うように引き伸ばす。
+    /// 単純な引き伸ばしだと深度の境目が輪郭からずれ、被写体の縁がボケたり、縁の外の背景がボケずに残ったりする。
+    private func edgeAwareDisparity(_ disparity: CIImage, crop: CGRect, sourceSize: CGSize,
+                                    guide: CIImage, lumaSigma: Float) -> CIImage? {
+        guard sourceSize.width > 0, sourceSize.height > 0 else { return nil }
+        // 深度画像の座標で、カラー画像と同じ範囲を切り出す
+        let sx = disparity.extent.width / sourceSize.width
+        let sy = disparity.extent.height / sourceSize.height
+        let smallCrop = CGRect(x: crop.minX * sx, y: crop.minY * sy, width: crop.width * sx, height: crop.height * sy)
+        let small = disparity.cropped(to: smallCrop)
+            .transformed(by: CGAffineTransform(translationX: -smallCrop.minX, y: -smallCrop.minY))
+        let filter = CIFilter.edgePreserveUpsample()
+        filter.inputImage = guide
+        filter.smallImage = small
+        filter.spatialSigma = 3
+        filter.lumaSigma = lumaSigma
+        guard let output = filter.outputImage else { return nil }
+        return output.cropped(to: guide.extent)
     }
 
     private func resample(_ image: CIImage, crop: CGRect, scale: CGFloat, width: CGFloat, height: CGFloat, highQuality: Bool) -> CIImage {
