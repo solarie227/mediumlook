@@ -180,6 +180,14 @@ struct InspectorView: View {
                     }
                 }
 
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("前ボケの量 \(Int((vm.settings.nearBlurScale * 100).rounded()))%")
+                    Slider(value: $vm.settings.nearBlurScale, in: 0...1, step: 0.05)
+                    Text("ピントより手前のボケの量です。100%が計算どおり。推定した深度では手前の距離がずれやすいので、不自然なときは下げてください。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Toggle(isOn: $vm.settings.refineEdges) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("輪郭を写真に合わせる")

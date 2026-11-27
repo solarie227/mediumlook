@@ -27,6 +27,8 @@ struct RenderSettings: Equatable, Sendable {
     var depthSource: DepthSource = .embedded
     /// 推定深度のときに使う、ピント位置までの距離（m）
     var subjectDistance: Double = 2.0
+    /// 前ボケ（ピント面より手前）の量の倍率。推定深度では手前の距離がずれやすいので調整できるようにする
+    var nearBlurScale: Double = 1.0
     /// 深度を引き伸ばすとき、写真の明暗の境目に合わせる
     var refineEdges: Bool = true
     /// 境目への合わせ方（0：なめらか 〜 1：細かく追従）
@@ -94,6 +96,7 @@ private struct BokehParams {
     var sampleCount: UInt32
     var highlightBoost: Float
     var originY: UInt32
+    var nearScale: Float
 }
 
 /// FilmShader の FilmParams と同じ並び
@@ -382,7 +385,8 @@ final class RenderEngine: @unchecked Sendable {
         let maxRadius = min(cap, max(1, k * max(relMin, relMax)))
         let samples = UInt32(min(maxSamples, max(32, Int(Double.pi * maxRadius * maxRadius / 4))))
         let params = BokehParams(k: Float(k), focusDisparity: focusDisparity, maxRadius: Float(maxRadius),
-                                 sampleCount: samples, highlightBoost: Float(settings.highlightBoost), originY: 0)
+                                 sampleCount: samples, highlightBoost: Float(settings.highlightBoost), originY: 0,
+                                 nearScale: Float(settings.nearBlurScale))
         return (params, focusDistance)
     }
 

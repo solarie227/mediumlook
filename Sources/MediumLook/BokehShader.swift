@@ -4,7 +4,7 @@ enum BokehShader {
 #include <metal_stdlib>
 using namespace metal;
 
-// Swift 側の BokehParams と同じ並び（すべて4バイト、合計24バイト）
+// Swift 側の BokehParams と同じ並び（すべて4バイト、合計28バイト）
 struct BokehParams {
     float k;               // 無限遠に対するボケ半径（px）
     float focusDisparity;  // ピント面の視差 Ds
@@ -12,11 +12,20 @@ struct BokehParams {
     uint  sampleCount;     // 1画素あたりのサンプル数
     float highlightBoost;  // 明るい画素をボケの中でどれだけ強く効かせるか
     uint  originY;         // 帯状に分割して処理するときの開始行
+    float nearScale;       // 前ボケ（ピント面より手前）の量の倍率
 };
 
 inline float cocRadius(float disparity, constant BokehParams &p) {
-    float r = p.k * fabs(1.0 - disparity / max(p.focusDisparity, 1e-4));
+    float rel = 1.0 - disparity / max(p.focusDisparity, 1e-4);
+    float r = p.k * fabs(rel);
+    if (rel < 0.0) { r *= p.nearScale; }   // 視差がピント面より大きい＝手前
     return min(r, p.maxRadius);
+}
+
+// ボケの円がその点を覆う割合。縁は大きさに応じて少しやわらかくする（硬いコインのように見えないように）
+inline float softCoverage(float r, float dist) {
+    float edge = max(1.0, 0.12 * r);
+    return saturate((r - dist) / edge + 0.5);
 }
 
 // 逆変換できる曲線の組。広げる: E(x) = x / (1 - kx)、戻す: C(y) = y / (1 + ky)、k = boost / (1 + boost)
@@ -49,23 +58,35 @@ kernel void bokehKernel(texture2d<float, access::sample> colorTex     [[texture(
     float rC = cocRadius(dC, p);
     float3 cC = expandHighlights(colorTex.sample(smp, pos).rgb, p.highlightBoost);
 
-    // 2つの層に分けて集める。
-    //  ・背景側（中心と同じ距離か奥の画素）：奥の画素は、手前のピントが合った画素の上には広がれない
-    //  ・手前側（中心より手前で、中心より大きくボケている画素）：中心の上に半透明に重なる。
-    //    1つにまとめて平均すると、ピントの合った中心の重みが勝って、手前のボケの縁がスパッと切れてしまう
+    // 2つの層に分けて作り、最後に重ねる（ゲームの被写界深度でよく使う、前ボケと後ろの分離）
+    //  ・前ボケの層：ピント面より手前でボケている画素。どの画素の上にも、自分のボケの大きさで半透明に広がる。
+    //    その点を覆っている割合を不透明度にする（手前の物の縁の内側にも、後ろが透けて見える）
+    //  ・後ろの層：ピント面とその奥。奥の画素は、手前のピントが合った画素の上には広がれない
+    float Ds = p.focusDisparity;
+    bool centerNear = (dC > Ds * 1.01) && (rC > 0.5);
     float rEffC = max(rC, 0.5);
-    float wC = 1.0 / (rEffC * rEffC);
-    float3 accB = cC * wC;
-    float wB = wC;
-    float3 accF = 0.0;
-    float wF = 0.0;
+
+    float n = float(p.sampleCount);
+    // 1サンプルが受け持つ面積（÷π）。前ボケの層の不透明度を「覆っている割合」として求めるのに使う
+    float areaPerSample = p.maxRadius * p.maxRadius / n;
+
+    float3 accN = 0.0;
+    float wN = 0.0;
+    float3 accB = 0.0;
+    float wB = 0.0;
+    if (centerNear) {
+        float w = areaPerSample / (rEffC * rEffC);
+        accN += cC * w;
+        wN += w;
+    } else {
+        float w = 1.0 / (rEffC * rEffC);
+        accB += cC * w;
+        wB += w;
+    }
 
     // 画素ごとに螺旋を回転させて、規則的な模様を崩す
     float rot = fract(sin(dot(pos, float2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
     const float golden = 2.39996323;
-    float n = float(p.sampleCount);
-    // 1サンプルが受け持つ面積（÷π）。手前の層の不透明度を「覆っている割合」として求めるのに使う
-    float areaPerSample = p.maxRadius * p.maxRadius / n;
 
     for (uint i = 1; i < p.sampleCount; i++) {
         float fi = float(i);
@@ -75,19 +96,26 @@ kernel void bokehKernel(texture2d<float, access::sample> colorTex     [[texture(
 
         float dS = disparityTex.sample(smp, sp).r;
         float rS = cocRadius(dS, p);
-        bool front = (dS > dC * 1.01 + 1e-4) && (rS > rC + 0.5);
+        bool near = (dS > Ds * 1.01) && (rS > 0.5);
 
-        if (front) {
+        if (near) {
             float rF = max(rS, 0.5);
-            float coverage = saturate(rF - dist + 0.5);
+            float coverage = softCoverage(rF, dist);
             if (coverage <= 0.0) { continue; }
             float wgt = coverage * areaPerSample / (rF * rF);
-            accF += expandHighlights(colorTex.sample(smp, sp).rgb, p.highlightBoost) * wgt;
-            wF += wgt;
+            accN += expandHighlights(colorTex.sample(smp, sp).rgb, p.highlightBoost) * wgt;
+            wN += wgt;
         } else {
-            float rEff = (dS < dC) ? min(rS, rC) : rS;
+            float rEff;
+            if (centerNear) {
+                // 中心が前ボケのとき、後ろの層は「手前の物の陰に見えているはずの背景」。
+                // 背景自身のボケが小さくても、中心のボケの範囲から集めて推し量る
+                rEff = rC;
+            } else {
+                rEff = (dS < dC) ? min(rS, rC) : rS;
+            }
             rEff = max(rEff, 0.5);
-            float coverage = saturate(rEff - dist + 0.5);
+            float coverage = softCoverage(rEff, dist);
             if (coverage <= 0.0) { continue; }
             float wgt = coverage / (rEff * rEff);
             accB += expandHighlights(colorTex.sample(smp, sp).rgb, p.highlightBoost) * wgt;
@@ -95,10 +123,10 @@ kernel void bokehKernel(texture2d<float, access::sample> colorTex     [[texture(
         }
     }
 
-    float3 background = accB / max(wB, 1e-6);
-    float alphaF = saturate(wF);
-    float3 foreground = wF > 0.0 ? accF / wF : background;
-    float3 result = compressHighlights(mix(background, foreground, alphaF), p.highlightBoost);
+    float3 background = wB > 0.0 ? accB / wB : cC;
+    float alphaN = saturate(wN);
+    float3 nearColor = wN > 0.0 ? accN / wN : background;
+    float3 result = compressHighlights(mix(background, nearColor, alphaN), p.highlightBoost);
     outTex.write(float4(result, 1.0), gid);
 }
 """#
