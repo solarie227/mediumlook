@@ -3,6 +3,7 @@ import AppKit
 
 @main
 struct MediumLookApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var vm = EditorViewModel()
 
     init() {
@@ -36,5 +37,12 @@ struct MediumLookApp: App {
                 Divider()
             }
         }
+    }
+}
+
+/// ウインドウを閉じたらアプリも終了する（ウインドウなしで動き続け、開き直しても何も出ない状態を防ぐ）
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
     }
 }
