@@ -212,10 +212,44 @@ struct InspectorView: View {
                 }
             }
 
+            Section("フィルム") {
+                Picker("フィルム", selection: $vm.settings.filmID) {
+                    ForEach(FilmStock.all) { stock in
+                        Text(stock.name).tag(stock.id)
+                    }
+                }
+                .labelsHidden()
+                Text(FilmStock.stock(id: vm.settings.filmID).note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if vm.settings.filmID != FilmStock.none.id {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("色と階調 \(Int((vm.settings.filmStrength * 100).rounded()))%")
+                        Slider(value: $vm.settings.filmStrength, in: 0...1, step: 0.05)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("粒状 ×\(vm.settings.grainScale, specifier: "%.2g")")
+                        Slider(value: $vm.settings.grainScale, in: 0...3, step: 0.25)
+                        Text("粒子の大きさはフォーマットで変わります。6×7は35mm判の約半分の細かさです。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("ハレーション ×\(vm.settings.halationScale, specifier: "%.2g")")
+                        Slider(value: $vm.settings.halationScale, in: 0...3, step: 0.25)
+                    }
+                }
+            }
+
             Section("仕上げ") {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("ハイライトの粘り \(vm.settings.highlightBoost, specifier: "%.1f")")
                     Slider(value: $vm.settings.highlightBoost, in: 0...4, step: 0.5)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("周辺減光 \(Int((vm.settings.vignette * 100).rounded()))%")
+                    Slider(value: $vm.settings.vignette, in: 0...1, step: 0.05)
                 }
             }
 

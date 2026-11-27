@@ -32,6 +32,16 @@ struct RenderSettings: Equatable, Sendable {
     /// 境目への合わせ方（0：なめらか 〜 1：細かく追従）
     var edgeStrength: Double = 0.5
 
+    /// フィルムの質感（FilmStock の id）
+    var filmID: String = FilmStock.none.id
+    /// 色と階調のかかり具合（0〜1）
+    var filmStrength: Double = 1.0
+    /// 粒状・ハレーションの強さ（フィルムごとの標準に対する倍率）
+    var grainScale: Double = 1.0
+    var halationScale: Double = 1.0
+    /// 周辺減光（0〜1、1で四隅が約2段暗くなる）
+    var vignette: Double = 0.0
+
     /// CIEdgePreserveUpsampleFilter の lumaSigma（小さいほど明暗の差に敏感）
     var edgeLumaSigma: Float { Float(0.3 * pow(0.1, edgeStrength)) }
 }
@@ -86,6 +96,33 @@ private struct BokehParams {
     var originY: UInt32
 }
 
+/// FilmShader の FilmParams と同じ並び
+private struct FilmParams {
+    var m0: SIMD4<Float>
+    var m1: SIMD4<Float>
+    var m2: SIMD4<Float>
+    var shadowTint: SIMD4<Float>
+    var highlightTint: SIMD4<Float>
+    var monoWeights: SIMD4<Float>
+    var halationColor: SIMD4<Float>
+    var curve: Float
+    var black: Float
+    var white: Float
+    var saturation: Float
+    var strength: Float
+    var grainAmp: Float
+    var grainSizePx: Float
+    var chromaGrain: Float
+    var halation: Float
+    var halationRadius: Float
+    var vignette: Float
+    var mono: UInt32
+    var seed: UInt32
+    var pad0: UInt32 = 0
+    var pad1: UInt32 = 0
+    var originY: UInt32 = 0
+}
+
 /// 切り出し・縮小済みの画像とテクスチャ
 private final class Prepared {
     let color: CIImage
@@ -98,6 +135,7 @@ private final class Prepared {
     var colorTexture: MTLTexture?
     var disparityTexture: MTLTexture?
     var outputTexture: MTLTexture?
+    var filmTexture: MTLTexture?
     var disparityRange: (min: Float, max: Float) = (0, 1)
 
     init(color: CIImage, disparity: CIImage, cropFactor: Double) {
@@ -123,6 +161,7 @@ final class RenderEngine: @unchecked Sendable {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
+    private let filmPipeline: MTLComputePipelineState
     private let ciContext: CIContext
     private let linearSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!
     private let displaySpace = CGColorSpace(name: CGColorSpace.displayP3)!
@@ -141,11 +180,15 @@ final class RenderEngine: @unchecked Sendable {
               let commandQueue = device.makeCommandQueue(),
               let library = try? device.makeLibrary(source: BokehShader.source, options: nil),
               let function = library.makeFunction(name: "bokehKernel"),
-              let pipeline = try? device.makeComputePipelineState(function: function)
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let filmLibrary = try? device.makeLibrary(source: FilmShader.source, options: nil),
+              let filmFunction = filmLibrary.makeFunction(name: "filmKernel"),
+              let filmPipeline = try? device.makeComputePipelineState(function: filmFunction)
         else { return nil }
         self.device = device
         self.commandQueue = commandQueue
         self.pipeline = pipeline
+        self.filmPipeline = filmPipeline
         self.ciContext = CIContext(mtlDevice: device, options: [
             .workingColorSpace: CGColorSpace(name: CGColorSpace.extendedLinearSRGB)!,
             .workingFormat: CIFormat.RGBAh,
@@ -209,24 +252,36 @@ final class RenderEngine: @unchecked Sendable {
     func export(_ settings: RenderSettings, to url: URL, completion: @escaping @Sendable (String?) -> Void) {
         queue.async { [self] in
             let preset = FormatPreset.preset(id: settings.presetID)
-            let depth = disparity(for: settings.depthSource)
-            guard let depthImage = depth.image, let used = depth.used else {
-                completion(depth.message ?? "深度データがありません")
+            guard let sourceColor else {
+                completion("写真を開いてください")
                 return
             }
-            guard let prepared = prepare(longEdge: nil, preset: preset, matchFOV: settings.matchFOV, disparity: depthImage,
-                                         edgeLumaSigma: settings.refineEdges ? settings.edgeLumaSigma : nil) else {
+            // 深度がない写真でも、フィルムの質感だけかけて書き出せる
+            let depth = disparity(for: settings.depthSource)
+            let disparityForPrep = depth.image ?? CIImage(color: .white).cropped(to: sourceColor.extent)
+            guard let prepared = prepare(longEdge: nil, preset: preset, matchFOV: settings.matchFOV,
+                                         disparity: disparityForPrep,
+                                         edgeLumaSigma: depth.image != nil && settings.refineEdges ? settings.edgeLumaSigma : nil)
+            else {
                 completion("画像の準備に失敗しました")
                 return
             }
-            guard let focus = focusDisparity(at: settings.focus, in: prepared) else {
-                completion("ピント位置の深度を読み取れませんでした")
-                return
+            var base = prepared.colorTexture
+            if let used = depth.used {
+                guard let focus = focusDisparity(at: settings.focus, in: prepared) else {
+                    completion("ピント位置の深度を読み取れませんでした")
+                    return
+                }
+                let (params, _) = makeParams(prepared: prepared, settings: settings, preset: preset,
+                                             focusDisparity: focus, used: used, maxSamples: Self.exportMaxSamples)
+                guard runBokeh(prepared, params: params) else {
+                    completion("ボケ処理に失敗しました")
+                    return
+                }
+                base = prepared.outputTexture
             }
-            let (params, _) = makeParams(prepared: prepared, settings: settings, preset: preset,
-                                         focusDisparity: focus, used: used, maxSamples: Self.exportMaxSamples)
-            guard let result = runBokeh(prepared, params: params) else {
-                completion("ボケ処理に失敗しました")
+            guard let result = finish(prepared, from: base, settings: settings, preset: preset) else {
+                completion("仕上げの処理に失敗しました")
                 return
             }
             do {
@@ -283,24 +338,28 @@ final class RenderEngine: @unchecked Sendable {
             }
 
         case .result:
-            guard let used = depth.used else {
-                out.image = makeCGImage(prepared.color)
-                break
+            // ボケをかけられないとき（深度がない等）も、フィルムの質感はかける
+            var base = prepared.colorTexture
+            if let used = depth.used {
+                if let focus = focusDisparity(at: settings.focus, in: prepared) {
+                    let (params, focusDistance) = makeParams(prepared: prepared, settings: settings, preset: preset,
+                                                             focusDisparity: focus, used: used,
+                                                             maxSamples: Self.previewMaxSamples)
+                    out.focusDistanceM = focusDistance
+                    if runBokeh(prepared, params: params) {
+                        base = prepared.outputTexture
+                    } else {
+                        out.message = "ボケ処理に失敗しました"
+                    }
+                } else {
+                    out.message = "その位置の深度を読み取れませんでした。別の場所をクリックしてください。"
+                }
             }
-            guard let focus = focusDisparity(at: settings.focus, in: prepared) else {
-                out.image = makeCGImage(prepared.color)
-                out.message = "その位置の深度を読み取れませんでした。別の場所をクリックしてください。"
-                break
-            }
-            let (params, focusDistance) = makeParams(prepared: prepared, settings: settings, preset: preset,
-                                                     focusDisparity: focus, used: used,
-                                                     maxSamples: Self.previewMaxSamples)
-            out.focusDistanceM = focusDistance
-            if let result = runBokeh(prepared, params: params) {
+            if let result = finish(prepared, from: base, settings: settings, preset: preset) {
                 out.image = makeCGImage(result)
             } else {
                 out.image = makeCGImage(prepared.color)
-                out.message = "ボケ処理に失敗しました"
+                out.message = "仕上げの処理に失敗しました"
             }
         }
 
@@ -490,15 +549,11 @@ final class RenderEngine: @unchecked Sendable {
         return texture
     }
 
-    /// GPU のタイムアウトを避けるため、256行ずつの帯に分けて処理する
-    private func runBokeh(_ prepared: Prepared, params: BokehParams) -> CIImage? {
-        guard let colorTexture = prepared.colorTexture,
-              let disparityTexture = prepared.disparityTexture,
-              let outputTexture = prepared.outputTexture
-        else { return nil }
-
-        let width = outputTexture.width
-        let height = outputTexture.height
+    /// GPU のタイムアウトを避けるため、256行ずつの帯に分けて処理する。
+    /// textures は 0, 1, 2… の順に設定し、params の開始行は setOrigin で書き換える
+    private func dispatchInStrips<P>(_ pipeline: MTLComputePipelineState, textures: [MTLTexture],
+                                     params: P, width: Int, height: Int,
+                                     setOrigin: (inout P, UInt32) -> Void) -> Bool {
         let tw = pipeline.threadExecutionWidth
         let th = max(1, pipeline.maxTotalThreadsPerThreadgroup / tw)
         let stripHeight = 256
@@ -507,23 +562,84 @@ final class RenderEngine: @unchecked Sendable {
             let rows = min(stripHeight, height - y)
             guard let commandBuffer = commandQueue.makeCommandBuffer(),
                   let encoder = commandBuffer.makeComputeCommandEncoder()
-            else { return nil }
+            else { return false }
             encoder.setComputePipelineState(pipeline)
-            encoder.setTexture(colorTexture, index: 0)
-            encoder.setTexture(disparityTexture, index: 1)
-            encoder.setTexture(outputTexture, index: 2)
+            for (index, texture) in textures.enumerated() {
+                encoder.setTexture(texture, index: index)
+            }
             var p = params
-            p.originY = UInt32(y)
-            encoder.setBytes(&p, length: MemoryLayout<BokehParams>.stride, index: 0)
+            setOrigin(&p, UInt32(y))
+            encoder.setBytes(&p, length: MemoryLayout<P>.stride, index: 0)
             encoder.dispatchThreads(MTLSize(width: width, height: rows, depth: 1),
                                     threadsPerThreadgroup: MTLSize(width: tw, height: th, depth: 1))
             encoder.endEncoding()
             commandBuffer.commit()
             commandBuffer.waitUntilCompleted()
-            if commandBuffer.status == .error { return nil }
+            if commandBuffer.status == .error { return false }
             y += rows
         }
-        return readTexture(outputTexture)
+        return true
+    }
+
+    /// ボケをかけて outputTexture に書く
+    private func runBokeh(_ prepared: Prepared, params: BokehParams) -> Bool {
+        guard let colorTexture = prepared.colorTexture,
+              let disparityTexture = prepared.disparityTexture,
+              let outputTexture = prepared.outputTexture
+        else { return false }
+        return dispatchInStrips(pipeline, textures: [colorTexture, disparityTexture, outputTexture],
+                                params: params, width: outputTexture.width, height: outputTexture.height) {
+            $0.originY = $1
+        }
+    }
+
+    /// フィルムの質感と周辺減光をかけて、CIImage にして返す（どちらもなければそのまま返す）
+    private func finish(_ prepared: Prepared, from input: MTLTexture?, settings: RenderSettings,
+                        preset: FormatPreset) -> CIImage? {
+        guard let input else { return nil }
+        guard let params = makeFilmParams(settings: settings, preset: preset,
+                                          width: input.width, height: input.height) else {
+            return readTexture(input)
+        }
+        if prepared.filmTexture == nil {
+            prepared.filmTexture = makeTexture(width: input.width, height: input.height)
+        }
+        guard let output = prepared.filmTexture,
+              dispatchInStrips(filmPipeline, textures: [input, output], params: params,
+                               width: output.width, height: output.height, setOrigin: { $0.originY = $1 })
+        else { return nil }
+        return readTexture(output)
+    }
+
+    /// フィルムのパラメーター。フィルムも周辺減光もなければ nil
+    private func makeFilmParams(settings: RenderSettings, preset: FormatPreset, width: Int, height: Int) -> FilmParams? {
+        let stock = FilmStock.stock(id: settings.filmID)
+        guard !stock.isNone || settings.vignette > 0 else { return nil }
+        let diagonal = hypot(Double(width), Double(height))
+        // 粒子の大きさをフィルム上の寸法で決め、フォーマットの対角長で画素に直す（6×7は35mm判の約半分の細かさ）
+        let grainSizePx = stock.grainMicrons / 1000 / preset.diagonalMM * diagonal
+        let m = stock.matrix
+        return FilmParams(
+            m0: SIMD4(m[0], m[1], m[2], 0),
+            m1: SIMD4(m[3], m[4], m[5], 0),
+            m2: SIMD4(m[6], m[7], m[8], 0),
+            shadowTint: SIMD4(stock.shadowTint, 0),
+            highlightTint: SIMD4(stock.highlightTint, 0),
+            monoWeights: SIMD4(stock.monoWeights, 0),
+            halationColor: SIMD4(1.0, 0.32, 0.1, 0),
+            curve: stock.curve,
+            black: stock.black,
+            white: stock.white,
+            saturation: stock.saturation,
+            strength: stock.isNone ? 0 : Float(settings.filmStrength),
+            grainAmp: stock.grainAmount * Float(settings.grainScale),
+            grainSizePx: Float(grainSizePx),
+            chromaGrain: 0.35,
+            halation: stock.halation * Float(settings.halationScale),
+            halationRadius: Float(0.004 * diagonal),
+            vignette: Float(settings.vignette),
+            mono: stock.mono ? 1 : 0,
+            seed: 1)
     }
 
     /// テクスチャ（上端が0行目）を CGImage 経由で CIImage に戻す
