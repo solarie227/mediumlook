@@ -569,7 +569,9 @@ final class RenderEngine: @unchecked Sendable {
             }
             var p = params
             setOrigin(&p, UInt32(y))
-            encoder.setBytes(&p, length: MemoryLayout<P>.stride, index: 0)
+            withUnsafeBytes(of: p) { bytes in
+                encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 0)
+            }
             encoder.dispatchThreads(MTLSize(width: width, height: rows, depth: 1),
                                     threadsPerThreadgroup: MTLSize(width: tw, height: th, depth: 1))
             encoder.endEncoding()
