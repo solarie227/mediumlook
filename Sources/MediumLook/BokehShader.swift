@@ -49,15 +49,23 @@ kernel void bokehKernel(texture2d<float, access::sample> colorTex     [[texture(
     float rC = cocRadius(dC, p);
     float3 cC = expandHighlights(colorTex.sample(smp, pos).rgb, p.highlightBoost);
 
+    // 2つの層に分けて集める。
+    //  ・背景側（中心と同じ距離か奥の画素）：奥の画素は、手前のピントが合った画素の上には広がれない
+    //  ・手前側（中心より手前で、中心より大きくボケている画素）：中心の上に半透明に重なる。
+    //    1つにまとめて平均すると、ピントの合った中心の重みが勝って、手前のボケの縁がスパッと切れてしまう
     float rEffC = max(rC, 0.5);
     float wC = 1.0 / (rEffC * rEffC);
-    float3 acc = cC * wC;
-    float wSum = wC;
+    float3 accB = cC * wC;
+    float wB = wC;
+    float3 accF = 0.0;
+    float wF = 0.0;
 
     // 画素ごとに螺旋を回転させて、規則的な模様を崩す
     float rot = fract(sin(dot(pos, float2(12.9898, 78.233))) * 43758.5453) * 6.2831853;
     const float golden = 2.39996323;
     float n = float(p.sampleCount);
+    // 1サンプルが受け持つ面積（÷π）。手前の層の不透明度を「覆っている割合」として求めるのに使う
+    float areaPerSample = p.maxRadius * p.maxRadius / n;
 
     for (uint i = 1; i < p.sampleCount; i++) {
         float fi = float(i);
@@ -67,21 +75,30 @@ kernel void bokehKernel(texture2d<float, access::sample> colorTex     [[texture(
 
         float dS = disparityTex.sample(smp, sp).r;
         float rS = cocRadius(dS, p);
+        bool front = (dS > dC * 1.01 + 1e-4) && (rS > rC + 0.5);
 
-        // 奥の画素（視差が小さい）は、手前のピントが合った画素の上には広がれない
-        float rEff = (dS < dC) ? min(rS, rC) : rS;
-        rEff = max(rEff, 0.5);
-
-        float coverage = saturate(rEff - dist + 0.5);
-        if (coverage <= 0.0) { continue; }
-
-        float wgt = coverage / (rEff * rEff);
-        float3 cS = expandHighlights(colorTex.sample(smp, sp).rgb, p.highlightBoost);
-        acc += cS * wgt;
-        wSum += wgt;
+        if (front) {
+            float rF = max(rS, 0.5);
+            float coverage = saturate(rF - dist + 0.5);
+            if (coverage <= 0.0) { continue; }
+            float wgt = coverage * areaPerSample / (rF * rF);
+            accF += expandHighlights(colorTex.sample(smp, sp).rgb, p.highlightBoost) * wgt;
+            wF += wgt;
+        } else {
+            float rEff = (dS < dC) ? min(rS, rC) : rS;
+            rEff = max(rEff, 0.5);
+            float coverage = saturate(rEff - dist + 0.5);
+            if (coverage <= 0.0) { continue; }
+            float wgt = coverage / (rEff * rEff);
+            accB += expandHighlights(colorTex.sample(smp, sp).rgb, p.highlightBoost) * wgt;
+            wB += wgt;
+        }
     }
 
-    float3 result = compressHighlights(acc / max(wSum, 1e-6), p.highlightBoost);
+    float3 background = accB / max(wB, 1e-6);
+    float alphaF = saturate(wF);
+    float3 foreground = wF > 0.0 ? accF / wF : background;
+    float3 result = compressHighlights(mix(background, foreground, alphaF), p.highlightBoost);
     outTex.write(float4(result, 1.0), gid);
 }
 """#
