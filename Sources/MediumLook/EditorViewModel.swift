@@ -45,8 +45,23 @@ final class EditorViewModel: ObservableObject {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.image]
         panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
-            open(url)
+        present(panel) { url in self.open(url) }
+    }
+
+    /// 開く・保存のダイアログを、ウインドウのシートとして出す。
+    /// runModal() でボタンやメニュー（⌘E）の処理の途中から出すと、ダイアログのボタンが反応しないことがあったため、
+    /// その処理が終わってから、止めずに出す
+    private func present(_ panel: NSSavePanel, completion: @escaping @MainActor (URL) -> Void) {
+        let handler: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor in completion(url) }
+        }
+        DispatchQueue.main.async {
+            if let window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first(where: { $0.isVisible }) {
+                panel.beginSheetModal(for: window, completionHandler: handler)
+            } else {
+                panel.begin(completionHandler: handler)
+            }
         }
     }
 
@@ -158,12 +173,15 @@ final class EditorViewModel: ObservableObject {
         panel.allowedContentTypes = [.jpeg, .heic, .tiff]
         panel.nameFieldStringValue = "\(fileName ?? "photo")_\(settings.presetID)_F\(String(format: "%g", settings.fNumber)).jpg"
         panel.message = "拡張子で形式が決まります（.jpg / .heic / .tif）"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        isExporting = true
-        engine.export(settings, to: url) { error in
-            Task { @MainActor in
-                self.isExporting = false
-                self.alertMessage = error ?? "書き出しました：\(url.lastPathComponent)"
+        // ダイアログを出した時点の設定で書き出す
+        let settings = self.settings
+        present(panel) { url in
+            self.isExporting = true
+            engine.export(settings, to: url) { error in
+                Task { @MainActor in
+                    self.isExporting = false
+                    self.alertMessage = error ?? "書き出しました：\(url.lastPathComponent)"
+                }
             }
         }
     }
